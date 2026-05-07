@@ -112,7 +112,16 @@ static uint32_t		msgs_wrong;
 // tos-set-symbol (a script) on the elf file). Thus, it is well suited as a node id variable.
 // ATTENTION: it is important to have TOS_NODE_ID in .data (not in .bss), otherwise tos-set-symbol
 // will not work
-uint16_t __attribute__((section(".data")))	TOS_NODE_ID = 0;
+// BUILD_NODE_ID can be injected via a generated node_id.h next to this file
+// (see scripts/build_node.sh). When the header is absent or the id is 0 the
+// UICR prompt path in initialization() handles interactive id entry.
+#if __has_include("node_id.h")
+#  include "node_id.h"
+#endif
+#ifndef BUILD_NODE_ID
+#  define BUILD_NODE_ID 0
+#endif
+uint16_t __attribute__((section(".data")))	TOS_NODE_ID = BUILD_NODE_ID;
 
 //**************************************************************************************************
 //***** Local Functions ****************************************************************************

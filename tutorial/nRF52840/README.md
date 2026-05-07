@@ -5,6 +5,10 @@ connection of each node in the network.
 
 Please feel free to play around; you may use main.c as an entry point.
 
+> **Using the nRF52840 USB Dongle (PCA10059)?** See [PCA10059.md](PCA10059.md) for the
+> Dongle-specific build / DFU flash workflow and the USB CDC console support
+> that ships in this repo. The instructions below target the nRF52840 DK.
+
 
 # Setup (Prerequisites)
 
