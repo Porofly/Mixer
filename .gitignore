@@ -5,3 +5,10 @@ Output/
 *.jlink
 .venv/
 .DS_Store
+CLAUDE.md
+
+# Build artifacts (per-node firmware images and DFU packages)
+tutorial/nRF52840/Tutorial_node*.hex
+tutorial/nRF52840/Tutorial_node*.elf
+tutorial/nRF52840/mixer_node*.zip
+tutorial/nRF52840/mixer_dfu.zip

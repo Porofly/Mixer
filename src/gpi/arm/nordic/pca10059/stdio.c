@@ -228,6 +228,19 @@ int __SEGGER_RTL_X_file_write(__SEGGER_RTL_FILE *stream, const char *s, unsigned
 
 int __putchar(int c, __printf_tag_ptr file) __attribute__((weak, alias("debug_putchar")));
 
+#ifdef MIXER_USB_CONSOLE
+
+extern void mixer_usb_cdc_putchar(char c);
+
+int debug_putchar(int c, __printf_tag_ptr file)
+{
+	(void)file;
+	mixer_usb_cdc_putchar((char)c);
+	return c;
+}
+
+#else
+
 int debug_putchar(int c, __printf_tag_ptr file)
 {
 	uint8_t			buf[2];
@@ -252,6 +265,8 @@ int debug_putchar(int c, __printf_tag_ptr file)
 	return c;
 }
 
+#endif // MIXER_USB_CONSOLE
+
 #endif	// GPI_ARCH_IS_CRT(...)
 
 #endif	// GPI_ARCH_IS_OS(NONE)
@@ -261,6 +276,25 @@ int debug_putchar(int c, __printf_tag_ptr file)
 // ATTENTION: implementations are very simple and not reentrant
 
 #if GPI_ARCH_IS_OS(NONE)
+
+#ifdef MIXER_USB_CONSOLE
+
+extern int mixer_usb_cdc_getchar(void);
+
+void gpi_stdin_flush()
+{
+	// USB CDC backend has no equivalent to UARTE FLUSHRX. The Mixer tutorial
+	// only flushes stdin once at startup; on the USB path we leave the FIFO
+	// alone (TinyUSB's CDC class drops bytes that the application never
+	// reads, so this is harmless).
+}
+
+int __attribute__((weak)) getchar()
+{
+	return mixer_usb_cdc_getchar();
+}
+
+#else
 
 void gpi_stdin_flush()
 {
@@ -289,6 +323,8 @@ int __attribute__((weak)) getchar()
 
 	return c;
 }
+
+#endif // MIXER_USB_CONSOLE
 
 // getsn()
 #include "gpi/stdio_getsn.c"

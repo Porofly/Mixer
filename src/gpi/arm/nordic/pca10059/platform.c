@@ -613,6 +613,14 @@ void gpi_platform_init()
 		NVIC_EnableIRQ(GPI_TRACE_DSR_IRQ);
 	#endif
 
+	// init USB CDC console (must be after HFCLK is stable)
+	#ifdef MIXER_USB_CONSOLE
+	{
+		extern void mixer_usb_cdc_init(void);
+		mixer_usb_cdc_init();
+	}
+	#endif
+
 
 	// GPI_TRACE_RETURN();
 }

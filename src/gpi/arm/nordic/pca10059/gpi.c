@@ -10,6 +10,10 @@
 #include "stdio.c"
 #include "resource_check.c"
 
+#ifdef MIXER_USB_CONSOLE
+#include "usb_cdc.c"
+#endif
+
 // warn if used runtime environment has not been tested (is not explicitly supported)
 // NOTE: This check is not strictly necessary if implementation files are written perfectly generic.
 // However, the latter is unrealistic, as it is so easy to miss something (particularly regarding

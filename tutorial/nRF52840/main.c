@@ -241,7 +241,7 @@ static void initialization(void)
 	printf("Hardware initialized. Compiled at " __DATE__ " " __TIME__ "\n");
 
 	// Check if TOS_NODE_ID is set. If not, request from stdin.
-	#if GPI_ARCH_IS_BOARD(nRF_PCA10056)
+	#if GPI_ARCH_IS_BOARD(nRF_PCA10056) || GPI_ARCH_IS_BOARD(nRF_PCA10059)
 		if (0 == TOS_NODE_ID)
 		{
 			uint16_t	data[2];
@@ -390,7 +390,13 @@ int main()
 		// start when deadline reached
 		// ATTENTION: don't delay after the polling loop (-> print before)
 		printf("starting round %" PRIu32 " ...\n", round);
-		while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0);
+		#ifdef MIXER_USB_CONSOLE
+			extern void mixer_usb_cdc_task(void);
+			while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0)
+				mixer_usb_cdc_task();
+		#else
+			while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0);
+		#endif
 
 		// Mixer round
 		t_ref = mixer_start();
