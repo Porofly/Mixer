@@ -99,6 +99,43 @@ int mixer_usb_cdc_getchar(void)
   return (n == 1) ? (int)c : -1;
 }
 
+// Non-blocking helpers exposed to application code. TinyUSB declares the
+// underlying tud_cdc_* primitives as static inline in cdc_device.h, so they
+// cannot be linked from a different translation unit -- we wrap them here.
+bool mixer_usb_cdc_connected(void)
+{
+  return tud_cdc_connected();
+}
+
+uint32_t mixer_usb_cdc_available(void)
+{
+  return tud_cdc_available();
+}
+
+uint32_t mixer_usb_cdc_read(void *buffer, uint32_t bufsize)
+{
+  return tud_cdc_read(buffer, bufsize);
+}
+
+// Raw byte write: NO '\n' -> '\r\n' expansion. For binary host protocol output.
+// Blocks until the byte is in the CDC TX FIFO. Caller is responsible for
+// flushing on frame boundaries via mixer_usb_cdc_flush().
+void mixer_usb_cdc_write_raw(const void *buffer, uint32_t bufsize)
+{
+  if (!tud_cdc_connected()) return;
+  const uint8_t *p = (const uint8_t *)buffer;
+  for (uint32_t i = 0; i < bufsize; ++i) {
+    while (tud_cdc_write_char((char)p[i]) == 0) {
+      tud_task();
+    }
+  }
+}
+
+void mixer_usb_cdc_flush(void)
+{
+  tud_cdc_write_flush();
+}
+
 //--------------------------------------------------------------------+
 // ISR shims
 //--------------------------------------------------------------------+

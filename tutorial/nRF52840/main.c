@@ -1,69 +1,34 @@
 /***************************************************************************************************
- ***************************************************************************************************
  *
- *	Copyright (c) 2019, Networked Embedded Systems Lab, TU Dresden
- *	All rights reserved.
+ *  Mixer tutorial firmware for nRF52840 USB dongle (PCA10059), modified for a
+ *  binary host protocol (see host_proto.h).
  *
- *	Redistribution and use in source and binary forms, with or without
- *	modification, are permitted provided that the following conditions are met:
- *		* Redistributions of source code must retain the above copyright
- *		  notice, this list of conditions and the following disclaimer.
- *		* Redistributions in binary form must reproduce the above copyright
- *		  notice, this list of conditions and the following disclaimer in the
- *		  documentation and/or other materials provided with the distribution.
- *		* Neither the name of the NES Lab or TU Dresden nor the
- *		  names of its contributors may be used to endorse or promote products
- *		  derived from this software without specific prior written permission.
+ *  Host <-> dongle framing:
+ *    [size_lo][size_hi][type][slot][payload...]   (size = 2 + payload_len)
  *
- *	THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- *	ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- *	WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- *	DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
- *	DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- *	(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- *	LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- *	ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- *	(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- *	SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *  Frames emitted by the dongle:
+ *    HP_TYPE_LOG          one-line boot banner
+ *    HP_TYPE_ROUND_STATS  one per finished round
+ *    HP_TYPE_RX_PAYLOAD   one per successfully decoded slot
  *
- ***********************************************************************************************//**
+ *  Frames accepted from the host:
+ *    HP_TYPE_TX_PAYLOAD   queues a payload for `slot` on the next round
+ *                         (slots not owned by this node are silently ignored)
  *
- *	@file					main.c
+ *  Original copyright: NES Lab, TU Dresden — see Mixer/LICENSE.
  *
- *	@brief					main entry point
- *
- *	@version				$Id$
- *	@date					TODO
- *
- *	@author					Fabian Mager
- *
- ***************************************************************************************************
-
- 	@details
-
-	TODO
-
  **************************************************************************************************/
-//***** Trace Settings *****************************************************************************
 
 #include "gpi/trace.h"
 
-// message groups for TRACE messages (used in GPI_TRACE_MSG() calls)
-// define groups appropriate for your needs, assign one bit per group
-// values > GPI_TRACE_LOG_USER (i.e. upper bits) are reserved
-#define TRACE_INFO		GPI_TRACE_MSG_TYPE_INFO
+#define TRACE_INFO  GPI_TRACE_MSG_TYPE_INFO
 
-// select active message groups, i.e., the messages to be printed (others will be dropped)
 #ifndef GPI_TRACE_BASE_SELECTION
-	#define GPI_TRACE_BASE_SELECTION	GPI_TRACE_LOG_STANDARD | GPI_TRACE_LOG_PROGRAM_FLOW
+  #define GPI_TRACE_BASE_SELECTION  GPI_TRACE_LOG_STANDARD | GPI_TRACE_LOG_PROGRAM_FLOW
 #endif
 GPI_TRACE_CONFIG(main, GPI_TRACE_BASE_SELECTION);
 
-//**************************************************************************************************
-//***** Includes ***********************************************************************************
-
 #include "mixer/mixer.h"
-
 #include "gpi/tools.h"
 #include "gpi/platform.h"
 #include "gpi/interrupts.h"
@@ -71,404 +36,331 @@ GPI_TRACE_CONFIG(main, GPI_TRACE_BASE_SELECTION);
 #include "gpi/olf.h"
 #include GPI_PLATFORM_PATH(radio.h)
 
-#include <nrf.h>
+#include "host_proto.h"
 
-#include <stdio.h>
-#include <inttypes.h>
+#include <nrf.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+extern void     mixer_usb_cdc_task(void);
+extern bool     mixer_usb_cdc_connected(void);
+extern uint32_t mixer_usb_cdc_available(void);
+extern uint32_t mixer_usb_cdc_read(void *buffer, uint32_t bufsize);
+extern void     mixer_usb_cdc_write_raw(const void *buffer, uint32_t bufsize);
+extern void     mixer_usb_cdc_flush(void);
 
-//**************************************************************************************************
-//***** Local Defines and Consts *******************************************************************
-
-#define PRINT_HEADER()		printf("# ID:%u ", TOS_NODE_ID)
-
-//**************************************************************************************************
-//***** Local Typedefs and Class Declarations ******************************************************
-
-
-
-//**************************************************************************************************
-//***** Forward Declarations ***********************************************************************
-
-
-
-//**************************************************************************************************
-//***** Local (Static) Variables *******************************************************************
-
-static uint8_t		node_id;
-static uint32_t		round;
-static uint32_t		msgs_decoded;
-static uint32_t		msgs_not_decoded;
-static uint32_t		msgs_weak;
-static uint32_t		msgs_wrong;
-
-//**************************************************************************************************
-//***** Global Variables ***************************************************************************
-
-// TOS_NODE_ID is a variable with very special handling: on FLOCKLAB and INDRIYA, its init value
-// gets overridden with the id of the node in the testbed during device programming (by calling
-// tos-set-symbol (a script) on the elf file). Thus, it is well suited as a node id variable.
-// ATTENTION: it is important to have TOS_NODE_ID in .data (not in .bss), otherwise tos-set-symbol
-// will not work
-// BUILD_NODE_ID can be injected via a generated node_id.h next to this file
-// (see scripts/build_node.sh). When the header is absent or the id is 0 the
-// UICR prompt path in initialization() handles interactive id entry.
 #if __has_include("node_id.h")
 #  include "node_id.h"
 #endif
 #ifndef BUILD_NODE_ID
 #  define BUILD_NODE_ID 0
 #endif
-uint16_t __attribute__((section(".data")))	TOS_NODE_ID = BUILD_NODE_ID;
+uint16_t __attribute__((section(".data"))) TOS_NODE_ID = BUILD_NODE_ID;
 
-//**************************************************************************************************
-//***** Local Functions ****************************************************************************
+static uint8_t node_id;          // logical (index into nodes[])
+static uint32_t round_counter;
+static uint32_t msgs_decoded, msgs_not_decoded, msgs_weak, msgs_wrong;
 
-// Print results of a Mixer round.
-static void print_results(uint8_t log_id)
+// TX queue: one pending payload per slot, "valid" flag per slot.
+// Host writes TX_PAYLOAD frames at any time during the idle window; the next
+// round picks them up and clears the valid flag. Marked volatile because the
+// idle-window poller path and the round-start path observe the same memory
+// across function-call boundaries; the compiler is free to assume non-volatile
+// memory cannot change between calls.
+static volatile uint8_t tx_queue[MX_GENERATION_SIZE][MX_PAYLOAD_SIZE];
+static volatile uint8_t tx_queue_valid[MX_GENERATION_SIZE];
+
+//==================================================================================================
+// Binary frame emission
+//==================================================================================================
+
+static void hp_emit_frame(uint8_t type, uint8_t slot, const void *payload, uint16_t payload_len)
 {
-	unsigned int	slot, slot_min, i;
-	uint32_t		rank = 0;
-
-	// Mixer internal stats (enabled with MX_VERBOSE_STATISTICS)
-	mixer_print_statistics();
-
-	for (i = 0; i < MX_GENERATION_SIZE; i++)
-	{
-		if (mixer_stat_slot(i) >= 0) ++rank;
-	}
-
-	PRINT_HEADER();
-	printf("round=%" PRIu32 " rank=%" PRIu32 " dec=%" PRIu32 " !dec=%" PRIu32 " weak=%" PRIu32
-	       " wrong=%" PRIu32 "\n",
-	       round, rank, msgs_decoded, msgs_not_decoded, msgs_weak, msgs_wrong);
-
-	msgs_decoded = 0;
-	msgs_not_decoded = 0;
-	msgs_weak = 0;
-	msgs_wrong = 0;
-
-	PRINT_HEADER();
-	printf("rank_up_slot=[");
-	for (slot_min = 0; 1; )
-	{
-		slot = -1u;
-		for (i = 0; i < MX_GENERATION_SIZE; ++i)
-		{
-			if (mixer_stat_slot(i) < slot_min)
-				continue;
-
-			if (slot > (uint16_t)mixer_stat_slot(i))
-				slot = mixer_stat_slot(i);
-		}
-
-		if (-1u == slot)
-			break;
-
-		for (i = 0; i < MX_GENERATION_SIZE; ++i)
-		{
-			if (mixer_stat_slot(i) == slot)
-				printf("%u;", slot);
-		}
-
-		slot_min = slot + 1;
-	}
-	printf("]\n");
-
-	PRINT_HEADER();
-	printf("rank_up_row=[");
-	for (slot_min = 0; 1; )
-	{
-		slot = -1u;
-		for (i = 0; i < MX_GENERATION_SIZE; ++i)
-		{
-			if (mixer_stat_slot(i) < slot_min)
-				continue;
-
-			if (slot > (uint16_t)mixer_stat_slot(i))
-				slot = mixer_stat_slot(i);
-		}
-
-		if (-1u == slot)
-			break;
-
-		for (i = 0; i < MX_GENERATION_SIZE; ++i)
-		{
-			if (mixer_stat_slot(i) == slot)
-				printf("%u;", i);
-		}
-
-		slot_min = slot + 1;
-	}
-	printf("]\n");
+    uint8_t hdr[4];
+    hdr[0] = (uint8_t)(2 + payload_len);          // size_lo
+    hdr[1] = (uint8_t)((2 + payload_len) >> 8);   // size_hi
+    hdr[2] = type;
+    hdr[3] = slot;
+    mixer_usb_cdc_write_raw(hdr, sizeof(hdr));
+    if (payload_len > 0) {
+        mixer_usb_cdc_write_raw(payload, payload_len);
+    }
+    mixer_usb_cdc_flush();
 }
 
-//**************************************************************************************************
+static void hp_emit_log(const char *s)
+{
+    uint16_t len = 0;
+    while (s[len] != '\0') len++;
+    hp_emit_frame(HP_TYPE_LOG, 0, s, len);
+}
+
+//==================================================================================================
+// Host RX: parse incoming frames during the idle window
+//==================================================================================================
+
+// State machine for the host->dongle stream. Bounded; if we ever see a frame
+// larger than HP_RX_MAX we just resync by dropping bytes.
+#define HP_RX_MAX  (2 + MX_PAYLOAD_SIZE)  // type + slot + max payload
+
+typedef enum {
+    HP_RX_WAIT_SIZE_LO,
+    HP_RX_WAIT_SIZE_HI,
+    HP_RX_PAYLOAD,
+} hp_rx_state_t;
+
+static struct {
+    hp_rx_state_t state;
+    uint16_t expected;
+    uint16_t have;
+    uint8_t  buf[HP_RX_MAX];
+} hp_rx = { HP_RX_WAIT_SIZE_LO, 0, 0, {0} };
+
+static uint32_t hp_rx_frames_total = 0;
+static uint32_t hp_rx_frames_tx_ok = 0;
+
+static void hp_rx_handle_frame(const uint8_t *frame, uint16_t len)
+{
+    hp_rx_frames_total++;
+    if (len < 2) return;
+    uint8_t type = frame[0];
+    uint8_t slot = frame[1];
+    const uint8_t *payload = &frame[2];
+    uint16_t payload_len = len - 2;
+
+    switch (type) {
+        case HP_TYPE_TX_PAYLOAD:
+            if (slot < MX_GENERATION_SIZE && payload_len == MX_PAYLOAD_SIZE) {
+                for (uint16_t k = 0; k < MX_PAYLOAD_SIZE; ++k) {
+                    tx_queue[slot][k] = payload[k];
+                }
+                tx_queue_valid[slot] = 1;
+                hp_rx_frames_tx_ok++;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static void hp_rx_feed(uint8_t b)
+{
+    switch (hp_rx.state) {
+        case HP_RX_WAIT_SIZE_LO:
+            hp_rx.expected = b;
+            hp_rx.state = HP_RX_WAIT_SIZE_HI;
+            break;
+        case HP_RX_WAIT_SIZE_HI:
+            hp_rx.expected |= ((uint16_t)b) << 8;
+            if (hp_rx.expected < 2 || hp_rx.expected > HP_RX_MAX) {
+                // Implausible -- drop and resync.
+                hp_rx.state = HP_RX_WAIT_SIZE_LO;
+            } else {
+                hp_rx.have = 0;
+                hp_rx.state = HP_RX_PAYLOAD;
+            }
+            break;
+        case HP_RX_PAYLOAD:
+            hp_rx.buf[hp_rx.have++] = b;
+            if (hp_rx.have == hp_rx.expected) {
+                hp_rx_handle_frame(hp_rx.buf, hp_rx.expected);
+                hp_rx.state = HP_RX_WAIT_SIZE_LO;
+            }
+            break;
+    }
+}
+
+static void hp_pump_host_rx(void)
+{
+    // Pump TinyUSB (also services TX) and drain any pending bytes.
+    mixer_usb_cdc_task();
+    if (!mixer_usb_cdc_connected()) return;
+    while (mixer_usb_cdc_available()) {
+        uint8_t b;
+        if (mixer_usb_cdc_read(&b, 1) == 1) {
+            hp_rx_feed(b);
+        } else {
+            break;
+        }
+    }
+}
+
+//==================================================================================================
+// Mixer wrapper
+//==================================================================================================
 
 static void initialization(void)
 {
-	// init platform
-	gpi_platform_init();
-	gpi_int_enable();
+    gpi_platform_init();
+    gpi_int_enable();
 
-	// Start random number generator (RNG) now so that we definitely have some random value as a seed later in the initialization.
-	NRF_RNG->INTENCLR = BV_BY_NAME(RNG_INTENCLR_VALRDY, Clear);
-	NRF_RNG->CONFIG = BV_BY_NAME(RNG_CONFIG_DERCEN, Enabled);
-	NRF_RNG->TASKS_START = 1;
+    // RNG seed source -- start now, harvest later.
+    NRF_RNG->INTENCLR = BV_BY_NAME(RNG_INTENCLR_VALRDY, Clear);
+    NRF_RNG->CONFIG = BV_BY_NAME(RNG_CONFIG_DERCEN, Enabled);
+    NRF_RNG->TASKS_START = 1;
 
-	// enable SysTick timer if needed
-	//#if MX_VERBOSE_PROFILE
-		SysTick->LOAD  = -1u;
-		SysTick->VAL   = 0;
-		SysTick->CTRL  = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
-	//#endif
+    SysTick->LOAD = -1u;
+    SysTick->VAL  = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
 
-	// init RF transceiver
-	gpi_radio_init(MX_PHY_MODE);
-	gpi_radio_set_tx_power(gpi_radio_dbm_to_power_level(MX_TX_PWR_DBM));
-	switch (MX_PHY_MODE)
-	{
-		case BLE_1M:
-		case BLE_2M:
-		case BLE_125k:
-		case BLE_500k:
-			gpi_radio_set_channel(39);
-			gpi_radio_ble_set_access_address(~0x8E89BED6);
-			break;
+    gpi_radio_init(MX_PHY_MODE);
+    gpi_radio_set_tx_power(gpi_radio_dbm_to_power_level(MX_TX_PWR_DBM));
+    switch (MX_PHY_MODE) {
+        case BLE_1M:
+        case BLE_2M:
+        case BLE_125k:
+        case BLE_500k:
+            gpi_radio_set_channel(39);
+            gpi_radio_ble_set_access_address(~0x8E89BED6);
+            break;
+        case IEEE_802_15_4:
+            gpi_radio_set_channel(26);
+            break;
+        default:
+            // Bad config -- spin.
+            while (1) {}
+    }
 
-		case IEEE_802_15_4:
-			gpi_radio_set_channel(26);
-			break;
+    if (TOS_NODE_ID == 0) {
+        // No BUILD_NODE_ID -- can't run. Spin forever; LOG will tell the host once connected.
+        while (!mixer_usb_cdc_connected()) { mixer_usb_cdc_task(); }
+        hp_emit_log("FATAL: BUILD_NODE_ID is 0\n");
+        while (1) { mixer_usb_cdc_task(); }
+    }
 
-		default:
-			printf("ERROR: MX_PHY_MODE is invalid!\n");
-			assert(0);
-	}
+    NRF_RNG->TASKS_STOP = 1;
+    uint8_t rng_value = BV_BY_VALUE(RNG_VALUE_VALUE, NRF_RNG->VALUE);
+    uint32_t rng_seed = rng_value * gpi_mulu_16x16(TOS_NODE_ID, gpi_tick_fast_native());
+    mixer_rand_seed(rng_seed);
 
-	printf("Hardware initialized. Compiled at " __DATE__ " " __TIME__ "\n");
+    for (node_id = 0; node_id < NUM_ELEMENTS(nodes); node_id++) {
+        if (nodes[node_id] == TOS_NODE_ID) break;
+    }
+    if (node_id >= NUM_ELEMENTS(nodes)) {
+        while (!mixer_usb_cdc_connected()) { mixer_usb_cdc_task(); }
+        hp_emit_log("FATAL: TOS_NODE_ID not in nodes[]\n");
+        while (1) { mixer_usb_cdc_task(); }
+    }
 
-	// Check if TOS_NODE_ID is set. If not, request from stdin.
-	#if GPI_ARCH_IS_BOARD(nRF_PCA10056) || GPI_ARCH_IS_BOARD(nRF_PCA10059)
-		if (0 == TOS_NODE_ID)
-		{
-			uint16_t	data[2];
-
-			// read from nRF UICR area
-			gpi_nrf_uicr_read(&data, 0, sizeof(data));
-
-			// check signature
-			if (0x55AA == data[0])
-			{
-				GPI_TRACE_MSG(TRACE_INFO, "non-volatile config is valid");
-				TOS_NODE_ID = data[1];
-			}
-			else GPI_TRACE_MSG(TRACE_INFO, "non-volatile config is invalid");
-
-			// if signature is invalid
-			while (0 == TOS_NODE_ID)
-			{
-				printf("Node ID not set. enter value: ");
-
-				// read from console
-				// scanf("%u", &TOS_NODE_ID);
-				char s[8];
-				TOS_NODE_ID = atoi(getsn(s, sizeof(s)));
-
-				printf("\nNode ID set to %u\n", TOS_NODE_ID);
-
-				// until input value is valid
-				if (0 == TOS_NODE_ID)
-					continue;
-
-				// store new value in UICR area
-				data[0] = 0x55AA;
-				data[1] = TOS_NODE_ID;
-
-				gpi_nrf_uicr_erase();
-				gpi_nrf_uicr_write(0, &data, sizeof(data));
-
-				// ATTENTION: Writing to UICR requires NVMC->CONFIG.WEN to be set which in turn
-				// invalidates the instruction cache (permanently). Besides that, UICR updates take
-				// effect only after reset (spec. 4413_417 v1.0 4.3.3 page 24). Therefore we do a soft
-				// reset after the write procedure.
-				printf("Restarting system...\n");
-				gpi_milli_sleep(100);		// safety margin (e.g. to empty UART Tx FIFO)
-				NVIC_SystemReset();
-
-				break;
-			}
-		}
-	#endif
-
-	printf("starting node %u ...\n", TOS_NODE_ID);
-
-	// Stop RNG because we only need one random number as seed.
-	NRF_RNG->TASKS_STOP = 1;
-	uint8_t rng_value = BV_BY_VALUE(RNG_VALUE_VALUE, NRF_RNG->VALUE);
-	uint32_t rng_seed = rng_value * gpi_mulu_16x16(TOS_NODE_ID, gpi_tick_fast_native());
-	printf("random seed for Mixer is %" PRIu32"\n", rng_seed);
-	// init RNG with randomized seed
-	mixer_rand_seed(rng_seed);
-
-	// translate physical node ID to logical node ID (zero-based) used inside mixer
-	for (node_id = 0; node_id < NUM_ELEMENTS(nodes); ++node_id)
-	{
-		if (nodes[node_id] == TOS_NODE_ID)
-			break;
-	}
-	if (node_id >= NUM_ELEMENTS(nodes))
-	{
-		printf("!!! PANIC: node mapping not found for node %u !!!\n", TOS_NODE_ID);
-		while (1);
-	}
-	printf("mapped physical node %u to logical id %u\n", TOS_NODE_ID, node_id);
-
-	// Print Mixer configuration.
-	mixer_print_config();
+    // Wait for host to attach so the banner isn't lost in the boot enumeration race.
+    while (!mixer_usb_cdc_connected()) { mixer_usb_cdc_task(); }
+    hp_emit_log(HOST_PROTO_VERSION_STRING);
 }
 
-//**************************************************************************************************
-//***** Global Functions ***************************************************************************
-
-int main()
+int main(void)
 {
-	// don't TRACE before gpi_platform_init()
-	// GPI_TRACE_FUNCTION();
+    Gpi_Hybrid_Tick t_ref;
+    unsigned int i;
 
-	Gpi_Hybrid_Tick	t_ref; // time reference point at the end of a Mixer round
-	unsigned int i;
+    initialization();
 
-	initialization();
+    t_ref = gpi_tick_hybrid();
 
-	// t_ref for first round is now (-> start as soon as possible)
-	t_ref = gpi_tick_hybrid();
+    for (round_counter = 1; 1; round_counter++) {
+        mixer_init(node_id);
 
-	// run
-	for (round = 1; 1; round++)
-	{
-		uint8_t	data[7];
+#if MX_WEAK_ZEROS
+        mixer_set_weak_release_slot(WEAK_RELEASE_SLOT);
+        mixer_set_weak_return_msg((void *)-1);
+#endif
 
-		printf("preparing round %" PRIu32 " ...\n", round);
+        // Push queued host payloads into mixer for slots we own. When the
+        // host has nothing queued we still send a zero-padded payload so the
+        // network stays synchronised even when no application traffic is
+        // active (Mixer relies on every assigned slot transmitting).
+        static const uint8_t zero_payload[MX_PAYLOAD_SIZE] = {0};
+        uint8_t scratch[MX_PAYLOAD_SIZE];
+        for (i = 0; i < MX_GENERATION_SIZE; i++) {
+            if (payload_distribution[i] != TOS_NODE_ID) continue;
+            if (tx_queue_valid[i]) {
+                // copy volatile queue into a non-volatile scratch so we can
+                // hand a plain uint8_t* to the mixer API.
+                for (uint16_t k = 0; k < MX_PAYLOAD_SIZE; ++k) scratch[k] = tx_queue[i][k];
+                tx_queue_valid[i] = 0;
+                mixer_write(i, scratch, MX_PAYLOAD_SIZE);
+            } else {
+                mixer_write(i, (void *)zero_payload, MX_PAYLOAD_SIZE);
+            }
+        }
 
-		// init mixer
-		mixer_init(node_id);
+        mixer_arm(
+            ((MX_INITIATOR_ID == TOS_NODE_ID) ? MX_ARM_INITIATOR : 0) |
+            ((1 == round_counter) ? MX_ARM_INFINITE_SCAN : 0));
 
-		#if MX_WEAK_ZEROS
-			mixer_set_weak_release_slot(WEAK_RELEASE_SLOT);
-			mixer_set_weak_return_msg((void*)-1);
-		#endif
+        if (MX_INITIATOR_ID == TOS_NODE_ID) {
+            t_ref += 3 * MX_SLOT_LENGTH;
+        }
 
-		// provide some test data messages
-		{
-			data[1] = node_id;
-			data[2] = TOS_NODE_ID;
-			data[3] = round;
-			data[4] = round >> 8;
-			data[5] = round >> 16;
-			data[6] = round >> 24;
+        // Idle window: service host RX so TX_PAYLOAD frames can land before next round.
+        while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0) {
+            hp_pump_host_rx();
+        }
 
+        t_ref = mixer_start();
 
-			for (i = 0; i < MX_GENERATION_SIZE; i++)
-			{
-				data[0] = i;
+        // Round in progress -- do NOT touch USB.
+        while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0);
 
-				if (payload_distribution[i] == TOS_NODE_ID)
-				{
-					// If data is set to NULL, the message is treated as weak message.
-					mixer_write(i, data, MIN(sizeof(data), MX_PAYLOAD_SIZE));
-				}
-			}
-		}
+        // Evaluate received slots and emit RX_PAYLOAD frames.
+        msgs_decoded = msgs_not_decoded = msgs_weak = msgs_wrong = 0;
+        uint32_t rank = 0;
+        for (i = 0; i < MX_GENERATION_SIZE; i++) {
+            if (mixer_stat_slot(i) >= 0) rank++;
+            void *p = mixer_read(i);
+            if (p == NULL) {
+                msgs_not_decoded++;
+            } else if (p == (void *)-1) {
+                msgs_weak++;
+            } else {
+                msgs_decoded++;
+                hp_emit_frame(HP_TYPE_RX_PAYLOAD, (uint8_t)i, p, MX_PAYLOAD_SIZE);
+            }
+        }
 
-		// arm mixer
+        // ROUND_STATS at the end so the host can correlate stats with the
+        // RX_PAYLOAD frames it just received.
+        hp_round_stats_t st = {
+            .round       = round_counter,
+            .rank        = rank,
+            .decoded     = msgs_decoded,
+            .not_decoded = msgs_not_decoded,
+            .weak        = msgs_weak,
+            .wrong       = msgs_wrong,
+            .node_id     = TOS_NODE_ID,
+        };
+        hp_emit_frame(HP_TYPE_ROUND_STATS, 0, &st, sizeof(st));
 
-		// start first round with infinite scan
-		// -> nodes join next available round, does not require simultaneous boot-up
-		mixer_arm(((MX_INITIATOR_ID == TOS_NODE_ID) ? MX_ARM_INITIATOR : 0) | ((1 == round) ? MX_ARM_INFINITE_SCAN : 0));
+        // Debug: also emit a tiny LOG line summarising host-RX activity. We
+        // only emit one every 8 rounds to avoid drowning the host link.
+        if ((round_counter & 0x7) == 0) {
+            char buf[64];
+            int n = 0;
+            // simple manual itoa to avoid pulling printf back in
+            n += 0; // placeholder
+            const char *s1 = "hp_rx total=";
+            for (const char *p = s1; *p && n < (int)sizeof(buf); ++p) buf[n++] = *p;
+            // uint32 to decimal
+            uint32_t v = hp_rx_frames_total;
+            char tmp[12]; int tn = 0;
+            if (v == 0) tmp[tn++] = '0';
+            while (v > 0) { tmp[tn++] = '0' + (v % 10); v /= 10; }
+            while (tn-- > 0 && n < (int)sizeof(buf)) buf[n++] = tmp[tn];
+            const char *s2 = " tx_ok=";
+            for (const char *p = s2; *p && n < (int)sizeof(buf); ++p) buf[n++] = *p;
+            v = hp_rx_frames_tx_ok; tn = 0;
+            if (v == 0) tmp[tn++] = '0';
+            while (v > 0) { tmp[tn++] = '0' + (v % 10); v /= 10; }
+            while (tn-- > 0 && n < (int)sizeof(buf)) buf[n++] = tmp[tn];
+            if (n < (int)sizeof(buf)) buf[n++] = '\n';
+            hp_emit_frame(HP_TYPE_LOG, 0, buf, (uint16_t)n);
+        }
 
-		// delay initiator a bit
-		// -> increase probability that all nodes are ready when initiator starts the round
-		// -> avoid problems in view of limited deadline accuracy
-		if (MX_INITIATOR_ID == TOS_NODE_ID)
-		{
-			t_ref += 3 * MX_SLOT_LENGTH;
-		}
+        // Schedule next round, leaving enough headroom that we don't oversleep
+        // the deadline while the USB FIFO drains.
+        t_ref += MAX(10 * MX_SLOT_LENGTH, GPI_TICK_MS_TO_HYBRID2(1000));
+    }
 
-		// start when deadline reached
-		// ATTENTION: don't delay after the polling loop (-> print before)
-		printf("starting round %" PRIu32 " ...\n", round);
-		#ifdef MIXER_USB_CONSOLE
-			extern void mixer_usb_cdc_task(void);
-			while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0)
-				mixer_usb_cdc_task();
-		#else
-			while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0);
-		#endif
-
-		// Mixer round
-		t_ref = mixer_start();
-
-		// Wait until t_ref (nominal end of Mixer round). 
-		while (gpi_tick_compare_hybrid(gpi_tick_hybrid(), t_ref) < 0);
-
-		// evaluate received data
-		for (i = 0; i < MX_GENERATION_SIZE; i++)
-		{
-			void *p = mixer_read(i);
-			if (NULL == p)
-			{
-				msgs_not_decoded++;
-			}
-			else if ((void*)-1 == p)
-			{
-				msgs_weak++;
-			}
-			else
-			{
-				memcpy(data, p, sizeof(data));
-				if ((data[0] == i) && (data[2] == payload_distribution[i]))
-				{
-					msgs_decoded++;
-				}
-				else
-				{
-					msgs_wrong++;
-				}
-
-				// use message 0 to check/adapt round number
-				if ((0 == i) && (MX_PAYLOAD_SIZE >= 7))
-				{
-					Generic32	r;
-
-					r.u8_ll = data[3];
-					r.u8_lh = data[4];
-					r.u8_hl = data[5];
-					r.u8_hh = data[6];
-
-					if (1 == round)
-					{
-						round = r.u32;
-						printf("synchronized to round %" PRIu32 "\n", r.u32);
-					}
-					else if (r.u32 != round)
-					{
-						printf("round mismatch: received %" PRIu32 " <> local %" PRIu32 "! trying resync ...\n", r.u32, round);
-						round = 0;	// increments to 1 with next round loop iteration
-					}
-				}
-			}
-		}
-
-		print_results(node_id);
-
-		// Set start time for next round. Check that there is enough time to print all results!
-		t_ref += MAX(10 * MX_SLOT_LENGTH, GPI_TICK_MS_TO_HYBRID2(1000));
-	}
-
-	GPI_TRACE_RETURN(0);
+    GPI_TRACE_RETURN(0);
 }
-
-//**************************************************************************************************
-//**************************************************************************************************

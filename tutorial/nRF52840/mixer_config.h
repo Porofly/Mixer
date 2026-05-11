@@ -43,6 +43,10 @@ static const uint8_t payload_distribution[] = {  1,  2,  1,  2,  1,  2,  1,  2};
 /*****************************************************************************/
 /* special settings **********************************************************/
 
+// Disabled for the ROS2 bridge build: every node always fills its assigned
+// slots (with zero-padded payloads when the host has nothing to send), so
+// weak-zero handling is unnecessary and would suppress the synchronisation
+// traffic that keeps two-node rounds locked together.
 #define MX_WEAK_ZEROS			0
 #define WEAK_RELEASE_SLOT		1
 #define MX_WARMSTART			0
@@ -60,7 +64,9 @@ static const uint8_t payload_distribution[] = {  1,  2,  1,  2,  1,  2,  1,  2};
 #define MX_SMART_SHUTDOWN_MODE	2
 
 // turn verbose log messages on or off
-#define MX_VERBOSE_STATISTICS	1
+// NOTE: VERBOSE_STATISTICS prints text via printf which collides with the
+// binary host protocol. Keep it off in production builds.
+#define MX_VERBOSE_STATISTICS	0
 #define MX_VERBOSE_PACKETS		0
 #define MX_VERBOSE_PROFILE		0
 
