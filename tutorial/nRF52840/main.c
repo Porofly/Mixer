@@ -118,12 +118,8 @@ static struct {
     uint8_t  buf[HP_RX_MAX];
 } hp_rx = { HP_RX_WAIT_SIZE_LO, 0, 0, {0} };
 
-static uint32_t hp_rx_frames_total = 0;
-static uint32_t hp_rx_frames_tx_ok = 0;
-
 static void hp_rx_handle_frame(const uint8_t *frame, uint16_t len)
 {
-    hp_rx_frames_total++;
     if (len < 2) return;
     uint8_t type = frame[0];
     uint8_t slot = frame[1];
@@ -137,7 +133,6 @@ static void hp_rx_handle_frame(const uint8_t *frame, uint16_t len)
                     tx_queue[slot][k] = payload[k];
                 }
                 tx_queue_valid[slot] = 1;
-                hp_rx_frames_tx_ok++;
             }
             break;
         default:
@@ -331,31 +326,6 @@ int main(void)
             .node_id     = TOS_NODE_ID,
         };
         hp_emit_frame(HP_TYPE_ROUND_STATS, 0, &st, sizeof(st));
-
-        // Debug: also emit a tiny LOG line summarising host-RX activity. We
-        // only emit one every 8 rounds to avoid drowning the host link.
-        if ((round_counter & 0x7) == 0) {
-            char buf[64];
-            int n = 0;
-            // simple manual itoa to avoid pulling printf back in
-            n += 0; // placeholder
-            const char *s1 = "hp_rx total=";
-            for (const char *p = s1; *p && n < (int)sizeof(buf); ++p) buf[n++] = *p;
-            // uint32 to decimal
-            uint32_t v = hp_rx_frames_total;
-            char tmp[12]; int tn = 0;
-            if (v == 0) tmp[tn++] = '0';
-            while (v > 0) { tmp[tn++] = '0' + (v % 10); v /= 10; }
-            while (tn-- > 0 && n < (int)sizeof(buf)) buf[n++] = tmp[tn];
-            const char *s2 = " tx_ok=";
-            for (const char *p = s2; *p && n < (int)sizeof(buf); ++p) buf[n++] = *p;
-            v = hp_rx_frames_tx_ok; tn = 0;
-            if (v == 0) tmp[tn++] = '0';
-            while (v > 0) { tmp[tn++] = '0' + (v % 10); v /= 10; }
-            while (tn-- > 0 && n < (int)sizeof(buf)) buf[n++] = tmp[tn];
-            if (n < (int)sizeof(buf)) buf[n++] = '\n';
-            hp_emit_frame(HP_TYPE_LOG, 0, buf, (uint16_t)n);
-        }
 
         // Schedule next round, leaving enough headroom that we don't oversleep
         // the deadline while the USB FIFO drains.
