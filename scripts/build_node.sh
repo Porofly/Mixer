@@ -4,7 +4,19 @@
 # bootloader. Output goes into tutorial/nRF52840/build/node<ID>/.
 #
 # Usage:
-#   scripts/build_node.sh <node_id>
+#   scripts/build_node.sh <node_id> [--round-length N] [--slot-us US]
+#
+# Optional rate tuning (both nodes must use identical values):
+#   --round-length N   override MX_ROUND_LENGTH (default in mixer_config.h: 50)
+#   --slot-us US       override MX_SLOT_LENGTH = GPI_TICK_US_TO_HYBRID2(US)
+#                      (default in mixer_config.h: 2000)
+#
+# Round period is roughly proportional to round_length * slot_us (plus PHY
+# overhead -- measured 50 * 2000us -> ~1.10s on this build, i.e. ~0.91 Hz).
+# Halving round_length roughly doubles the host publish rate ceiling.
+#
+# Both overrides edit mixer_config.h in place; the original is restored on
+# exit (success or failure) via a trap, so the working tree stays clean.
 #
 # Environment overrides:
 #   SES_DIR     -- root of the SEGGER Embedded Studio install (default: 5.70a)
@@ -14,14 +26,58 @@
 
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <node_id>" >&2
+usage() {
+    sed -n '2,18p' "$0" | sed 's/^# \?//'
     exit 2
-fi
+}
 
-NODE_ID="$1"
+NODE_ID=""
+ROUND_LENGTH=""
+SLOT_US=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --round-length)
+            ROUND_LENGTH="${2:-}"
+            shift 2 || usage
+            ;;
+        --slot-us)
+            SLOT_US="${2:-}"
+            shift 2 || usage
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --*)
+            echo "error: unknown option '$1'" >&2
+            usage
+            ;;
+        *)
+            if [[ -n "$NODE_ID" ]]; then
+                echo "error: extra positional argument '$1'" >&2
+                usage
+            fi
+            NODE_ID="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$NODE_ID" ]]; then
+    echo "error: <node_id> is required" >&2
+    usage
+fi
 if ! [[ "$NODE_ID" =~ ^[0-9]+$ ]] || (( NODE_ID < 1 || NODE_ID > 254 )); then
     echo "error: node_id must be an integer in [1, 254], got '$NODE_ID'" >&2
+    exit 2
+fi
+if [[ -n "$ROUND_LENGTH" ]] \
+   && ! { [[ "$ROUND_LENGTH" =~ ^[0-9]+$ ]] && (( ROUND_LENGTH >= 1 && ROUND_LENGTH <= 255 )); }; then
+    echo "error: --round-length must be an integer in [1, 255], got '$ROUND_LENGTH'" >&2
+    exit 2
+fi
+if [[ -n "$SLOT_US" ]] \
+   && ! { [[ "$SLOT_US" =~ ^[0-9]+$ ]] && (( SLOT_US >= 100 && SLOT_US <= 1000000 )); }; then
+    echo "error: --slot-us must be an integer in [100, 1000000], got '$SLOT_US'" >&2
     exit 2
 fi
 
@@ -61,6 +117,38 @@ cat > "$NODE_ID_HDR" <<EOF
 EOF
 
 echo "[build_node] node_id=${NODE_ID} -> ${OUT_DIR}"
+
+# Apply --round-length / --slot-us by patching mixer_config.h in place. Always
+# restore the original on exit so the working tree stays clean even if the
+# build (or a Ctrl-C) interrupts us.
+MIXER_CFG="$TUTORIAL_DIR/mixer_config.h"
+MIXER_CFG_BAK=""
+if [[ -n "$ROUND_LENGTH" || -n "$SLOT_US" ]]; then
+    MIXER_CFG_BAK="$(mktemp -p "$TUTORIAL_DIR" mixer_config.h.bak.XXXXXX)"
+    cp "$MIXER_CFG" "$MIXER_CFG_BAK"
+    trap 'cp "$MIXER_CFG_BAK" "$MIXER_CFG"; rm -f "$MIXER_CFG_BAK"' EXIT
+
+    if [[ -n "$ROUND_LENGTH" ]]; then
+        # Match: '#define MX_ROUND_LENGTH<ws><digits>' optionally followed by '//' comment
+        sed -E -i "s|^([[:space:]]*#define[[:space:]]+MX_ROUND_LENGTH[[:space:]]+)[0-9]+|\1${ROUND_LENGTH}|" "$MIXER_CFG"
+        if ! grep -qE "^[[:space:]]*#define[[:space:]]+MX_ROUND_LENGTH[[:space:]]+${ROUND_LENGTH}\\b" "$MIXER_CFG"; then
+            echo "error: failed to patch MX_ROUND_LENGTH in $MIXER_CFG" >&2
+            exit 1
+        fi
+        echo "[build_node] patched MX_ROUND_LENGTH = ${ROUND_LENGTH}"
+    fi
+    if [[ -n "$SLOT_US" ]]; then
+        # Match the active line: '#define MX_SLOT_LENGTH ... GPI_TICK_US_TO_HYBRID2(<digits>)'
+        # Leaves the commented-out '// #define MX_SLOT_LENGTH ...' alternative untouched.
+        sed -E -i "s|^([[:space:]]*#define[[:space:]]+MX_SLOT_LENGTH[[:space:]]+GPI_TICK_US_TO_HYBRID2\\()[0-9]+(\\))|\1${SLOT_US}\2|" "$MIXER_CFG"
+        if ! grep -qE "^[[:space:]]*#define[[:space:]]+MX_SLOT_LENGTH[[:space:]]+GPI_TICK_US_TO_HYBRID2\\(${SLOT_US}\\)" "$MIXER_CFG"; then
+            echo "error: failed to patch MX_SLOT_LENGTH in $MIXER_CFG" >&2
+            exit 1
+        fi
+        echo "[build_node] patched MX_SLOT_LENGTH = GPI_TICK_US_TO_HYBRID2(${SLOT_US})"
+    fi
+fi
+
 cd "$TUTORIAL_DIR"
 
 "$EMBUILD" -config "$CONFIG" -rebuild "$PROJECT"
